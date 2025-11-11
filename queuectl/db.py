@@ -1,8 +1,4 @@
 import sqlite3
-import socket
-import os
-import time
-import random
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -75,63 +71,27 @@ class Database:
     
     @contextmanager
     def connection(self):
-        max_retries = 5
-        base_delay = 0.1
         conn = None
-        
-        for attempt in range(max_retries):
-            try:
-                conn = sqlite3.connect(self.db_path, timeout=30.0)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA temp_store=MEMORY")
-                conn.execute("PRAGMA mmap_size=268435456")
-                yield conn
-                return
-            except sqlite3.OperationalError as e:
-                if conn:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    conn = None
-                
-                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
-                    time.sleep(delay)
-                    continue
-                else:
-                    raise
-            finally:
-                if conn:
-                    try:
-                        conn.close()
-                    except:
-                        pass
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            yield conn
+        finally:
+            if conn:
+                conn.close()
     
     @contextmanager
     def transaction(self):
-        max_retries = 3
-        
-        for attempt in range(max_retries):
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                with self.connection() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        yield conn
-                        conn.commit()
-                        return
-                    except Exception:
-                        conn.rollback()
-                        raise
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                    delay = 0.1 * (2 ** attempt) + random.uniform(0, 0.05)
-                    time.sleep(delay)
-                    continue
-                else:
-                    raise
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
     
     def claim_job(self, worker_id: str) -> Optional[Job]:
         with self.transaction() as conn:
@@ -240,9 +200,20 @@ class Database:
             return workers
     
     def recover_stale_jobs(self, stale_timeout_seconds: int = 30, backoff_base: int = 2):
+        stale_jobs = self._find_stale_jobs(stale_timeout_seconds)
+        
+        from .queue import QueueManager
+        queue_manager = QueueManager(self)
+        
+        for job in stale_jobs:
+            error_msg = f"Job recovered from stale worker {job.worker_id}"
+            queue_manager.handle_job_failure(job, error_msg, backoff_base)
+        
+        return len(stale_jobs)
+    
+    def _find_stale_jobs(self, stale_timeout_seconds: int) -> List[Job]:
         with self.connection() as conn:
             cursor = conn.cursor()
-            
             cursor.execute("""
                 SELECT j.id, j.command, j.state, j.attempts, j.max_retries, 
                        j.created_at, j.updated_at, j.next_run_at, j.last_error, 
@@ -272,12 +243,4 @@ class Database:
                     worker_id=row[12]
                 )
                 stale_jobs.append(job)
-        
-        from .queue import QueueManager
-        queue_manager = QueueManager(self)
-        
-        for job in stale_jobs:
-            error_msg = f"Job recovered from stale worker {job.worker_id}"
-            queue_manager.handle_job_failure(job, error_msg, backoff_base)
-        
-        return len(stale_jobs)
+            return stale_jobs

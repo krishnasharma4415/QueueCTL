@@ -12,19 +12,22 @@ class QueueManager:
     
     def enqueue_job(self, job: Job) -> str:
         with self.db.transaction() as conn:
-            conn.execute("""
-                INSERT INTO jobs (id, command, state, attempts, max_retries, 
-                                created_at, updated_at, next_run_at, priority, 
-                                run_at, timeout_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job.id, job.command, job.state.value, job.attempts, job.max_retries,
-                job.created_at.isoformat(), job.updated_at.isoformat(), 
-                job.next_run_at.isoformat(), job.priority,
-                job.run_at.isoformat() if job.run_at else None,
-                job.timeout_seconds
-            ))
+            self._insert_job(conn, job)
         return job.id
+    
+    def _insert_job(self, conn, job: Job):
+        conn.execute("""
+            INSERT INTO jobs (id, command, state, attempts, max_retries, 
+                            created_at, updated_at, next_run_at, priority, 
+                            run_at, timeout_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job.id, job.command, job.state.value, job.attempts, job.max_retries,
+            job.created_at.isoformat(), job.updated_at.isoformat(), 
+            job.next_run_at.isoformat(), job.priority,
+            job.run_at.isoformat() if job.run_at else None,
+            job.timeout_seconds
+        ))
     
     def create_job_from_spec(self, job_spec: Dict[str, Any], default_max_retries: int = 3) -> Job:
         job_id = job_spec.get('id', str(uuid.uuid4()))
@@ -53,6 +56,12 @@ class QueueManager:
         )
     
     def validate_and_enqueue(self, job_spec_str: str, default_max_retries: int = 3) -> str:
+        job_spec = self._parse_job_spec(job_spec_str)
+        self._validate_job_spec(job_spec)
+        job = self.create_job_from_spec(job_spec, default_max_retries)
+        return self.enqueue_job(job)
+    
+    def _parse_job_spec(self, job_spec_str: str) -> Dict[str, Any]:
         try:
             job_spec = json.loads(job_spec_str)
         except json.JSONDecodeError as e:
@@ -61,13 +70,13 @@ class QueueManager:
         if not isinstance(job_spec, dict):
             raise ValueError("Job specification must be a JSON object")
         
+        return job_spec
+    
+    def _validate_job_spec(self, job_spec: Dict[str, Any]):
         if 'id' in job_spec:
             existing_job = self.get_job(job_spec['id'])
             if existing_job:
                 raise ValueError(f"Job with ID '{job_spec['id']}' already exists")
-        
-        job = self.create_job_from_spec(job_spec, default_max_retries)
-        return self.enqueue_job(job)
     
     def get_job(self, job_id: str) -> Optional[Job]:
         with self.db.connection() as conn:
@@ -94,17 +103,18 @@ class QueueManager:
     
     def handle_job_failure(self, job: Job, error_message: str, backoff_base: int = 2):
         job.attempts += 1
-        job.last_error = error_message[:1000] if error_message else None
+        job.last_error = (error_message[:1000] if error_message else None)
         job.updated_at = datetime.utcnow()
         job.worker_id = None
         
         if job.attempts > job.max_retries:
             self.move_to_dlq(job)
-        else:
-            delay_seconds = self.calculate_backoff_delay(job.attempts, backoff_base)
-            job.next_run_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
-            job.state = JobState.PENDING
-            self.update_job(job)
+            return
+        
+        delay_seconds = self.calculate_backoff_delay(job.attempts, backoff_base)
+        job.next_run_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+        job.state = JobState.PENDING
+        self.update_job(job)
     
     def handle_job_success(self, job: Job):
         job.state = JobState.COMPLETED
@@ -114,58 +124,62 @@ class QueueManager:
     
     def list_jobs(self, state: Optional[str] = None, limit: int = 10, 
                   since: Optional[str] = None, sort: str = 'created_at') -> List[Job]:
+        query, params = self._build_list_query(state, since, sort, limit)
+        
         with self.db.connection() as conn:
             cursor = conn.cursor()
-            
-            query = """
-                SELECT id, command, state, attempts, max_retries, created_at, 
-                       updated_at, next_run_at, last_error, priority, run_at, 
-                       timeout_seconds, worker_id
-                FROM jobs
-            """
-            params = []
-            conditions = []
-            
-            if state:
-                conditions.append("state = ?")
-                params.append(state)
-            
-            if since:
-                conditions.append("created_at >= ?")
-                params.append(since)
-            
-            if conditions:
-                query += " WHERE " + " AND ".join(conditions)
-            
-            if sort in ['created_at', 'updated_at', 'priority']:
-                if sort == 'priority':
-                    query += f" ORDER BY {sort} DESC, created_at ASC"
-                else:
-                    query += f" ORDER BY {sort} DESC"
-            
-            query += " LIMIT ?"
-            params.append(limit)
-            
             cursor.execute(query, params)
-            
-            jobs = []
-            for row in cursor.fetchall():
-                jobs.append(Job(
-                    id=row[0],
-                    command=row[1],
-                    state=JobState(row[2]),
-                    attempts=row[3],
-                    max_retries=row[4],
-                    created_at=datetime.fromisoformat(row[5]),
-                    updated_at=datetime.fromisoformat(row[6]),
-                    next_run_at=datetime.fromisoformat(row[7]),
-                    last_error=row[8],
-                    priority=row[9] or 0,
-                    run_at=datetime.fromisoformat(row[10]) if row[10] else None,
-                    timeout_seconds=row[11],
-                    worker_id=row[12]
-                ))
-            return jobs
+            return [self._row_to_job(row) for row in cursor.fetchall()]
+    
+    def _build_list_query(self, state: Optional[str], since: Optional[str], 
+                          sort: str, limit: int) -> tuple:
+        query = """
+            SELECT id, command, state, attempts, max_retries, created_at, 
+                   updated_at, next_run_at, last_error, priority, run_at, 
+                   timeout_seconds, worker_id
+            FROM jobs
+        """
+        params = []
+        conditions = []
+        
+        if state:
+            conditions.append("state = ?")
+            params.append(state)
+        
+        if since:
+            conditions.append("created_at >= ?")
+            params.append(since)
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        if sort in ['created_at', 'updated_at', 'priority']:
+            if sort == 'priority':
+                query += f" ORDER BY {sort} DESC, created_at ASC"
+            else:
+                query += f" ORDER BY {sort} DESC"
+        
+        query += " LIMIT ?"
+        params.append(limit)
+        
+        return query, params
+    
+    def _row_to_job(self, row) -> Job:
+        return Job(
+            id=row[0],
+            command=row[1],
+            state=JobState(row[2]),
+            attempts=row[3],
+            max_retries=row[4],
+            created_at=datetime.fromisoformat(row[5]),
+            updated_at=datetime.fromisoformat(row[6]),
+            next_run_at=datetime.fromisoformat(row[7]),
+            last_error=row[8],
+            priority=row[9] or 0,
+            run_at=datetime.fromisoformat(row[10]) if row[10] else None,
+            timeout_seconds=row[11],
+            worker_id=row[12]
+        )
     
     def get_job_counts(self) -> Dict[str, int]:
         with self.db.connection() as conn:
@@ -197,25 +211,7 @@ class QueueManager:
                 ORDER BY updated_at DESC
                 LIMIT ?
             """, (limit,))
-            
-            failures = []
-            for row in cursor.fetchall():
-                failures.append(Job(
-                    id=row[0],
-                    command=row[1],
-                    state=JobState(row[2]),
-                    attempts=row[3],
-                    max_retries=row[4],
-                    created_at=datetime.fromisoformat(row[5]),
-                    updated_at=datetime.fromisoformat(row[6]),
-                    next_run_at=datetime.fromisoformat(row[7]),
-                    last_error=row[8],
-                    priority=row[9] or 0,
-                    run_at=datetime.fromisoformat(row[10]) if row[10] else None,
-                    timeout_seconds=row[11],
-                    worker_id=row[12]
-                ))
-            return failures
+            return [self._row_to_job(row) for row in cursor.fetchall()]
     
     def move_to_dlq(self, job: Job):
         now = datetime.utcnow()

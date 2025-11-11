@@ -60,11 +60,7 @@ class WorkerProcess:
         
         try:
             while not self.stopping:
-                now = datetime.utcnow()
-                
-                if (now - last_heartbeat).total_seconds() >= 5:
-                    self._update_heartbeat()
-                    last_heartbeat = now
+                last_heartbeat = self._update_heartbeat_if_needed(last_heartbeat)
                 
                 job = self.claim_job()
                 if job:
@@ -76,6 +72,13 @@ class WorkerProcess:
         finally:
             self.cleanup()
     
+    def _update_heartbeat_if_needed(self, last_heartbeat: datetime) -> datetime:
+        now = datetime.utcnow()
+        if (now - last_heartbeat).total_seconds() >= 5:
+            self._update_heartbeat()
+            return now
+        return last_heartbeat
+    
     def claim_job(self) -> Optional[Job]:
         return self.db.claim_job(self.worker_id)
     
@@ -86,7 +89,6 @@ class WorkerProcess:
         try:
             config = self.config_manager.get_config()
             timeout = job.timeout_seconds or config.default_timeout_seconds
-            
             result = subprocess.run(
                 job.command,
                 shell=True,
@@ -98,27 +100,41 @@ class WorkerProcess:
             duration = (datetime.utcnow() - start_time).total_seconds()
             
             if result.returncode == 0:
-                self.logger.info(f"Worker {self.worker_id} completed job {job.id} successfully in {duration:.2f}s")
-                self.queue_manager.handle_job_success(job)
+                self._handle_success(job, duration)
             else:
-                error_msg = f"Command failed with exit code {result.returncode}"
-                if result.stderr:
-                    error_msg += f": {result.stderr.strip()}"
-                
-                self.logger.warning(f"Worker {self.worker_id} job {job.id} failed in {duration:.2f}s: {error_msg}")
-                self.queue_manager.handle_job_failure(job, error_msg, config.backoff_base)
+                self._handle_command_failure(job, result, duration, config.backoff_base)
                 
         except subprocess.TimeoutExpired:
-            duration = (datetime.utcnow() - start_time).total_seconds()
-            error_msg = f"Command timed out after {timeout} seconds"
-            self.logger.warning(f"Worker {self.worker_id} job {job.id} timed out after {duration:.2f}s")
-            self.queue_manager.handle_job_failure(job, error_msg, config.backoff_base)
+            self._handle_timeout(job, start_time, timeout)
             
         except Exception as e:
-            duration = (datetime.utcnow() - start_time).total_seconds()
-            error_msg = f"Execution error: {str(e)}"
-            self.logger.error(f"Worker {self.worker_id} job {job.id} failed with error after {duration:.2f}s: {error_msg}")
-            self.queue_manager.handle_job_failure(job, error_msg, config.backoff_base)
+            self._handle_execution_error(job, start_time, e)
+    
+    def _handle_success(self, job: Job, duration: float):
+        self.logger.info(f"Worker {self.worker_id} completed job {job.id} successfully in {duration:.2f}s")
+        self.queue_manager.handle_job_success(job)
+    
+    def _handle_command_failure(self, job: Job, result, duration: float, backoff_base: int):
+        error_msg = f"Command failed with exit code {result.returncode}"
+        if result.stderr:
+            error_msg += f": {result.stderr.strip()[:500]}"
+        
+        self.logger.warning(f"Worker {self.worker_id} job {job.id} failed in {duration:.2f}s: {error_msg}")
+        self.queue_manager.handle_job_failure(job, error_msg, backoff_base)
+    
+    def _handle_timeout(self, job: Job, start_time: datetime, timeout: int):
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        error_msg = f"Command timed out after {timeout} seconds"
+        self.logger.warning(f"Worker {self.worker_id} job {job.id} timed out after {duration:.2f}s")
+        config = self.config_manager.get_config()
+        self.queue_manager.handle_job_failure(job, error_msg, config.backoff_base)
+    
+    def _handle_execution_error(self, job: Job, start_time: datetime, error: Exception):
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        error_msg = f"Execution error: {str(error)}"
+        self.logger.error(f"Worker {self.worker_id} job {job.id} failed with error after {duration:.2f}s: {error_msg}")
+        config = self.config_manager.get_config()
+        self.queue_manager.handle_job_failure(job, error_msg, config.backoff_base)
     
     def cleanup(self):
         self.logger.info(f"Worker {self.worker_id} cleaning up")

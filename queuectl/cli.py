@@ -53,35 +53,10 @@ def enqueue(job_spec, file, command, job_id, max_retries, priority, timeout):
         queuectl enqueue --command "dir" --id "list-files" --timeout 30
     """
     try:
-        input_methods = sum([bool(file), bool(job_spec), bool(command)])
-        
-        if input_methods == 0:
-            click.echo("Error: Must provide job specification via JSON string, --file, or --command", err=True)
-            sys.exit(1)
-        elif input_methods > 1:
-            click.echo("Error: Cannot specify multiple input methods (choose one: JSON string, --file, or --command)", err=True)
-            sys.exit(1)
+        job_spec_str = _get_job_spec_string(job_spec, file, command, job_id, max_retries, priority, timeout)
         
         config_manager = ConfigManager(Database('.data/queuectl.db'))
         config = config_manager.get_config()
-        
-        if file:
-            with open(file, 'r') as f:
-                job_spec_str = f.read()
-        elif job_spec:
-            job_spec_str = job_spec
-        elif command:
-            job_dict = {"command": command}
-            if job_id:
-                job_dict["id"] = job_id
-            if max_retries is not None:
-                job_dict["max_retries"] = max_retries
-            if priority != 0:
-                job_dict["priority"] = priority
-            if timeout:
-                job_dict["timeout_seconds"] = timeout
-            
-            job_spec_str = json.dumps(job_dict)
         
         queue_manager = QueueManager(Database(config.db_path))
         result_job_id = queue_manager.validate_and_enqueue(job_spec_str, config.max_retries)
@@ -91,6 +66,33 @@ def enqueue(job_spec, file, command, job_id, max_retries, priority, timeout):
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+def _get_job_spec_string(job_spec, file, command, job_id, max_retries, priority, timeout):
+    input_methods = sum([bool(file), bool(job_spec), bool(command)])
+    
+    if input_methods == 0:
+        raise ValueError("Must provide job specification via JSON string, --file, or --command")
+    elif input_methods > 1:
+        raise ValueError("Cannot specify multiple input methods (choose one: JSON string, --file, or --command)")
+    
+    if file:
+        with open(file, 'r') as f:
+            return f.read()
+    elif job_spec:
+        return job_spec
+    else:
+        job_dict = {"command": command}
+        if job_id:
+            job_dict["id"] = job_id
+        if max_retries is not None:
+            job_dict["max_retries"] = max_retries
+        if priority != 0:
+            job_dict["priority"] = priority
+        if timeout:
+            job_dict["timeout_seconds"] = timeout
+        
+        return json.dumps(job_dict)
 
 
 @cli.group()

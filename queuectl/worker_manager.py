@@ -73,40 +73,49 @@ class WorkerManager:
             return
         
         self.logger.info(f"Stopping {len(pids)} worker processes")
-        
-        for pid in pids:
-            try:
-                if sys.platform == "win32":
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        os.kill(pid, signal.CTRL_C_EVENT)
-                else:
-                    os.kill(pid, signal.SIGTERM)
-                self.logger.info(f"Sent termination signal to worker process {pid}")
-            except ProcessLookupError:
-                self.logger.warning(f"Worker process {pid} not found")
-            except (PermissionError, OSError) as e:
-                self.logger.error(f"Error stopping worker process {pid}: {e}")
-        
+        self._send_termination_signals(pids)
         time.sleep(2)
-        
-        for pid in pids:
-            try:
-                os.kill(pid, 0)
-                self.logger.warning(f"Worker process {pid} still running, sending force kill")
-                if sys.platform == "win32":
-                    try:
-                        subprocess.run(['taskkill', '/F', '/PID', str(pid)], 
-                                     capture_output=True, check=False)
-                    except FileNotFoundError:
-                        os.kill(pid, signal.SIGTERM)
-                else:
-                    os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        self._force_kill_remaining(pids)
         
         if self.pid_file.exists():
             self.pid_file.unlink()
         
         self.logger.info("All workers stopped")
+    
+    def _send_termination_signals(self, pids: List[int]):
+        for pid in pids:
+            try:
+                self._send_signal(pid, signal.SIGTERM)
+                self.logger.info(f"Sent termination signal to worker process {pid}")
+            except ProcessLookupError:
+                self.logger.warning(f"Worker process {pid} not found")
+            except (PermissionError, OSError) as e:
+                self.logger.error(f"Error stopping worker process {pid}: {e}")
+    
+    def _send_signal(self, pid: int, sig):
+        if sys.platform == "win32":
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                os.kill(pid, signal.CTRL_C_EVENT)
+        else:
+            os.kill(pid, sig)
+    
+    def _force_kill_remaining(self, pids: List[int]):
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                self.logger.warning(f"Worker process {pid} still running, sending force kill")
+                self._force_kill(pid)
+            except ProcessLookupError:
+                pass
+    
+    def _force_kill(self, pid: int):
+        if sys.platform == "win32":
+            try:
+                subprocess.run(['taskkill', '/F', '/PID', str(pid)], 
+                             capture_output=True, check=False)
+            except FileNotFoundError:
+                os.kill(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGKILL)

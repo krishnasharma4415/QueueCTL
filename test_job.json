@@ -1,0 +1,6 @@
+{
+  "command": "echo Job from JSON file",
+  "id": "json-job",
+  "priority": 5,
+  "max_retries": 2
+}
